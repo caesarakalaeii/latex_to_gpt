@@ -20,7 +20,12 @@
   outputs =
     # `...` rather than a closed { self, nixpkgs }: adding a second input later
     # would otherwise fail with "called with unexpected argument 'self'".
-    { nixpkgs, ... }:
+    #
+    # `self` is not decoration: it is the only way a wrapper in the store can
+    # name this repo's own files, which is what anchors every verb (see
+    # rootPreamble). It does mean the wrappers rebuild whenever a tracked file
+    # changes -- four shellcheck runs, about a second, and worth it.
+    { self, nixpkgs, ... }:
     let
       lib = nixpkgs.lib;
 
@@ -137,9 +142,10 @@
       # that echoed "not applicable" would only turn this map into a liar;
       # absence is information, and `nix flake show` then reports the truth.
       #
-      # `text` is bash under `set -euo pipefail`, shellcheck'd at BUILD time, and
-      # it runs in the caller's current directory so an agent can test
-      # uncommitted edits.
+      # `text` is bash under `set -euo pipefail` and shellcheck'd at BUILD time.
+      # It gets $REPO_ROOT / $SRC_ROOT and `require_work_tree` from rootPreamble,
+      # and it must use them: the caller's cwd is never this repo's location, and
+      # a verb that defaults to it is either lying (lint) or destructive (fmt).
       commands = pkgs: {
         setup = {
           # There is no requirements.txt, no pyproject.toml and no lockfile in
@@ -158,9 +164,21 @@
           # This is also why the shell cannot be made offline via
           # `python313.withPackages`: nixpkgs ships openai 2.41.1, i.e. exactly
           # the major this code cannot run against.
-          description = "(network) create .venv with the openai client the script needs";
+          #
+          # --allow-existing is not cosmetic: without it a second `dev-setup` --
+          # the obvious move in any retry loop, and the only move after this
+          # pin changes -- dies with "A virtual environment already exists at:
+          # .venv" and exit 2, BEFORE the install line runs. So the bootstrap
+          # verb failed on precisely the trees that had already been set up. Do
+          # not reach for --clear instead: that deletes a working venv to
+          # re-download what is already in it.
+          description = "(network) create/update .venv with the openai client the script needs";
+          # A .venv belongs to a checkout, and the store snapshot is read-only,
+          # so there is nothing sensible to do without one -- least of all
+          # unpacking a venv into whichever directory the caller stood in.
           text = ''
-            uv venv "$REPO_ROOT/.venv"
+            require_work_tree
+            uv venv --allow-existing "$REPO_ROOT/.venv"
             uv pip install --python "$REPO_ROOT/.venv/bin/python" 'openai<1'
           '';
         };
@@ -169,29 +187,63 @@
           # the nix toolchain to PATH, so a bare name resolves to the store copy
           # and misses everything `setup` installed into .venv.
           #
-          # Deliberately NOT cd'ing to $REPO_ROOT. The script reads ./latex.txt
-          # and writes ./smoothed_output relative to the current directory, so
-          # running from the caller's cwd is what lets an agent point it at a
-          # thesis living anywhere. api_secrets.py still resolves either way:
-          # python puts the *script's* directory on sys.path, and that is
-          # $REPO_ROOT.
+          # It cds to the root, and that is a fix rather than a preference.
+          # text_smoother.py hardcodes RAW_FILE_LOCATION = 'latex.txt' and
+          # open('smoothed_output', 'w'), both relative to the CURRENT directory,
+          # so the earlier version -- which stayed in the caller's cwd on the
+          # theory that this let an agent point it at a thesis living anywhere --
+          # meant `nix run /path/to/this-repo#run` read a stranger's latex.txt
+          # and wrote a file called smoothed_output next to it. The README's
+          # contract is "place your LaTeX code file in the same directory as the
+          # script", i.e. the root, which is now the only place it looks.
           #
-          # Needs api_secrets.py to exist (copy api_secrets_example.py and fill
-          # in the key) and a latex.txt in the working directory. Both are
-          # gitignored secrets/inputs, so neither the flake nor `checks` can
-          # provide them.
-          description = "smooth ./latex.txt into ./smoothed_output (needs `setup`, api_secrets.py, network)";
-          text = ''"$REPO_ROOT/.venv/bin/python" "$REPO_ROOT/text_smoother.py" "$@"'';
+          # Needs api_secrets.py (copy api_secrets_example.py and fill in the
+          # key), a latex.txt in the root, and .venv from `setup`. All three are
+          # gitignored, hence absent from the snapshot: another verb that cannot
+          # work without a checkout.
+          description = "smooth latex.txt into smoothed_output, both in the repo root (needs `setup`, api_secrets.py, network)";
+          text = ''
+            require_work_tree
+            cd "$REPO_ROOT"
+            "$REPO_ROOT/.venv/bin/python" "$REPO_ROOT/text_smoother.py" "$@"
+          '';
         };
         lint = {
-          # Defaults to the whole tree so a bare `dev-lint` is useful, but still
-          # forwards args for `dev-lint text_smoother.py`.
-          description = "ruff check";
-          text = ''ruff check "$@"'';
+          description = "ruff check (the whole repo, from any directory)";
+          # `cd` first, then a bare `.` default. Both halves are load-bearing:
+          # `ruff check "$@"` alone checked the caller's cwd, and even
+          # `ruff check "''${@:-$SOMEROOT}"` still checks the cwd the moment the
+          # caller passes a flag rather than a path (`--fix`, `--select F401`),
+          # because any argument suppresses the default. Standing in the root
+          # closes both, and it makes a relative path argument mean the same thing
+          # no matter where the command was invoked from.
+          #
+          # ruff's incremental cache lands in $PWD. In the snapshot branch that is
+          # the read-only store, so it is switched off there -- two files do not
+          # need a cache, and littering the caller's directory with .ruff_cache
+          # was part of the same bug.
+          text = ''
+            if [ -n "$REPO_ROOT" ]; then
+              cd "$REPO_ROOT"
+              ruff check "''${@:-.}"
+            else
+              cd "$SRC_ROOT"
+              ruff check --no-cache "''${@:-.}"
+            fi
+          '';
         };
         fmt = {
-          description = "ruff format (rewrites files)";
-          text = ''ruff format "$@"'';
+          description = "ruff format (rewrites files, so it needs the checkout)";
+          # MUTATING, hence no $SRC_ROOT fallback: formatting the snapshot would
+          # either fail on the read-only store or, worse, report "1 file
+          # reformatted" for a change nobody can ever see. And no cwd default --
+          # that is exactly how `nix run /path/to/this-repo#fmt` used to rewrite
+          # Python that had nothing to do with this project.
+          text = ''
+            require_work_tree
+            cd "$REPO_ROOT"
+            ruff format "''${@:-.}"
+          '';
         };
       };
 
@@ -209,13 +261,53 @@
           export LD_LIBRARY_PATH="${lib.makeLibraryPath (nativeLibs pkgs)}''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
         '';
 
-      # Every command gets $REPO_ROOT. `nix run` and `nix develop` both start in
-      # whatever directory they were invoked from, so a bare `.venv` silently
-      # forks a second environment as soon as an agent works from a subdirectory.
-      # Note we do NOT cd there: commands act on the caller's cwd on purpose.
+      # Every command gets two anchors, and NEITHER of them is the caller's cwd.
+      #
+      #   $SRC_ROOT   this flake's own source tree as copied into the store when
+      #               the wrapper was built: always present, always exactly this
+      #               repo's content, always read-only. It is the only repo path
+      #               `nix run /elsewhere/this-repo#lint` can be certain of -- the
+      #               wrapper is a store path and has no idea where the checkout
+      #               it came from lives. It sees git-tracked files only, so a
+      #               brand new file is invisible until `git add`.
+      #   $REPO_ROOT  the live checkout, or EMPTY when the caller is not standing
+      #               in it. Preferred whenever it exists: it is writable and it
+      #               sees edits the snapshot does not.
+      #
+      # The previous `git rev-parse --show-toplevel || pwd` was worse than no
+      # anchor at all. From an unrelated directory it resolved to that directory,
+      # so `nix run <url>#lint` -- the form CI and a cold agent use -- reported
+      # "All checks passed!" having inspected zero of this repo's files, and
+      # `nix run <url>#fmt` rewrote a stranger's source. `git rev-parse` on its
+      # own is not enough either: run from inside some OTHER checkout it happily
+      # reports that repo. So a candidate only counts as ours when every
+      # top-level name in the snapshot also exists in it -- cheap, needs no tool
+      # beyond the shell, and unlike comparing flake.nix it survives editing this
+      # file.
+      #
+      # Read-only verbs then fall back to $SRC_ROOT and report the same thing from
+      # any cwd. Verbs that write or keep state call `require_work_tree` and
+      # refuse instead: the snapshot is read-only, and the caller's directory is
+      # not ours to guess at.
       rootPreamble = ''
-        REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
-        export REPO_ROOT
+        SRC_ROOT=${self}
+        REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+        if [ -n "$REPO_ROOT" ]; then
+          for entry in "$SRC_ROOT"/*; do
+            [ -e "$REPO_ROOT/''${entry##*/}" ] || { REPO_ROOT=""; break; }
+          done
+        fi
+        export SRC_ROOT REPO_ROOT
+
+        # Called by every verb that writes, before it writes anything.
+        require_work_tree() {
+          if [ -z "$REPO_ROOT" ]; then
+            echo "''${0##*/}: this verb writes to the checkout, and the directory" >&2
+            echo "  you called from is not one. Run it from inside the work tree," >&2
+            echo "  or from a \`nix develop\` started there." >&2
+            exit 1
+          fi
+        }
       '';
 
       # One derivation per command, reused by both `apps` and the dev shell, so
@@ -338,6 +430,67 @@
                   exit 1
                 }
               done
+              touch "$out"
+            '';
+
+        # The build sandbox is an ideal stand-in for "some unrelated directory":
+        # no git repo, no config, and no Python in it but what we plant here.
+        #
+        # This check exists because the flake shipped with exactly the opposite
+        # behaviour. Every command ended in a bare "$@", so given no arguments
+        # they acted on the CALLER's cwd: `nix run <url>#lint` -- the form CI and
+        # a cold agent use -- printed "All checks passed!" having inspected none
+        # of this repo, and `nix run <url>#fmt` rewrote source files outside the
+        # repo entirely. Both are regressions a human reviewer will not notice,
+        # so they get a machine.
+        anchoring =
+          pkgs.runCommand "anchoring-check"
+            {
+              nativeBuildInputs = lib.attrValues (wrappers pkgs);
+            }
+            ''
+              decoy="$NIX_BUILD_TOP/decoy"
+              logs="$NIX_BUILD_TOP/logs"
+              mkdir -p "$decoy" "$logs"
+              printf 'import os,sys\nx=1\n' > "$decoy/decoy.py"
+              cp "$decoy/decoy.py" "$decoy/decoy.py.orig"
+              cd "$decoy"
+
+              # Read-only verbs must inspect this repo wherever they are called
+              # from. Asserted through --show-files rather than through findings,
+              # so this check does not start lying the day someone fixes the last
+              # ruff warning.
+              dev-lint --show-files > "$logs/files.log"
+              grep -q '/text_smoother.py$' "$logs/files.log" || {
+                echo "dev-lint did not look at the repo:" >&2
+                cat "$logs/files.log" >&2
+                exit 1
+              }
+              if grep -q decoy "$logs/files.log"; then
+                echo "dev-lint reached into the caller's directory:" >&2
+                cat "$logs/files.log" >&2
+                exit 1
+              fi
+
+              # Verbs that write must refuse when there is no checkout, rather
+              # than improvise one out of $PWD. setup and run would also need the
+              # network, so this doubles as proof they exit before reaching it.
+              for verb in fmt setup run; do
+                if "dev-$verb" > "$logs/$verb.log" 2>&1; then
+                  echo "dev-$verb should have refused outside a work tree:" >&2
+                  cat "$logs/$verb.log" >&2
+                  exit 1
+                fi
+              done
+
+              # Nothing whatsoever may have appeared next to the caller: not a
+              # reformatted file, not a .venv, not even a .ruff_cache.
+              cmp "$decoy/decoy.py" "$decoy/decoy.py.orig"
+              [ "$(find "$decoy" -mindepth 1 | wc -l)" -eq 2 ] || {
+                echo "something was written into the caller's directory:" >&2
+                find "$decoy" -mindepth 1 >&2
+                exit 1
+              }
               touch "$out"
             '';
       });
