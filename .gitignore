@@ -2,3 +2,10 @@ api_secrets.py
 latex.txt
 *smoothed_output*
 *pycache*
+.venv/
+.direnv/
+.cache/
+__pycache__/
+*.pyc
+result
+result-*
