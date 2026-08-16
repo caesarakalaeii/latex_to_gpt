@@ -5,6 +5,7 @@ latex.txt
 .venv/
 .direnv/
 .cache/
+.ruff_cache/
 __pycache__/
 *.pyc
 result
